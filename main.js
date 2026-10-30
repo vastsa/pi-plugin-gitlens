@@ -6,15 +6,18 @@
  * Plugin id : pi.gitlens
  * Commands  : gitlens.open / gitlens.openHistory / gitlens.openChanges /
  *             gitlens.openBranches / gitlens.openBlame
- * Panel channels: git.state / git.status / git.log / git.show / git.diff /
- *             git.blame / git.branch / git.commit / git.stash
+ * Panel channels: git.state / git.selectRepository / git.refreshRepositories /
+ *             git.status / git.log / git.show / git.diff / git.blame /
+ *             git.branch / git.commit / git.stash
  *
  * Design notes
  * - All git access goes through ./git.js: execFile("git", [...]) with
  *   argument arrays, `-C <repoRoot>`, no shell, no string interpolation.
- * - The repository root is always resolved from pi.workspace.get() via
- *   `git rev-parse --show-toplevel`, so the plugin can never run git against a
- *   directory the user did not open.
+ * - A workspace can hold several independent repositories (a frontend, a
+ *   backend, a shared library, …). ./repositories.js discovers them with a
+ *   bounded depth-3, cached, symlink-free walk. Every git request must name a
+ *   discovered `repoRoot`; anything else is rejected, so the plugin can never
+ *   run git against a directory the user did not open.
  * - Handlers are for the work-panel view only. Nothing is registered as an
  *   agent tool; the AI does not get git_status / git_commit / etc.
  *
@@ -37,6 +40,12 @@ const {
   parseBranchList,
   parseStashList,
 } = require("./git");
+
+const {
+  canonicalKey,
+  createDiscovery,
+  findRepository,
+} = require("./repositories");
 
 const VIEWS = ["overview", "history", "diff", "branches", "blame"];
 const MAX_TOOL_PATCH_CHARS = 120_000;
@@ -186,7 +195,26 @@ function requireBranchName(value) {
   return name;
 }
 
-async function getRepoContext() {
+// ---------------------------------------------------------------------------
+// repository context
+// ---------------------------------------------------------------------------
+
+/**
+ * A workspace can hold several independent repositories. Discovery is bounded
+ * (depth 3, directory cap), cached per workspace and validated on every git
+ * request: a request may only name a root discovery reported, never an
+ * arbitrary path.
+ */
+const repositoryDiscovery = createDiscovery({ resolveRepoRoot });
+
+/** Repository the panel selected per workspace (plugin lifetime). */
+const selectedRepositories = new Map();
+
+function workspaceKeyFor(workspace) {
+  return canonicalKey(workspace.path) || String(workspace.path);
+}
+
+async function readWorkspace() {
   const workspace = await pi.workspace.get();
   if (!workspace || !workspace.path) {
     throw fail(
@@ -194,16 +222,90 @@ async function getRepoContext() {
       "No project is open. Open a project folder first, then retry.",
     );
   }
-  let root;
+  return workspace;
+}
+
+async function inspectWorkspace(workspace, options = {}) {
+  return repositoryDiscovery.get(workspace.path, options);
+}
+
+/** Remembered selection, else discovery order (the workspace's own repo first). */
+function selectedRootFor(workspace, scan) {
+  const key = workspaceKeyFor(workspace);
+  if (!scan || !scan.repos.length) {
+    selectedRepositories.delete(key);
+    return null;
+  }
+  const remembered = selectedRepositories.get(key);
+  const match = remembered ? findRepository(scan.repos, remembered) : null;
+  return match ? match.root : scan.repos[0].root;
+}
+
+async function panelRepositoryState(workspace, scan, viewState) {
+  return {
+    ok: true,
+    state: viewState,
+    workspace: workspace ? { path: workspace.path, name: workspace.name || null } : null,
+    workspaceKey: workspace ? workspaceKeyFor(workspace) : null,
+    repositories: scan
+      ? scan.repos.map((repo) => ({
+          root: repo.root,
+          name: repo.name,
+          relativePath: repo.relativePath,
+          primary: repo.primary,
+        }))
+      : [],
+    repoRoot: workspace && scan ? selectedRootFor(workspace, scan) : null,
+    repositoriesTruncated: Boolean(scan && scan.truncated),
+    inspectionWarning: (scan && scan.inspectionWarning) || null,
+    inspectionError: (scan && scan.error) || null,
+    appearance: await readAppearance(),
+  };
+}
+
+/** `git.state`: never throws, always keeps the workspace when it exists. */
+async function readPanelState(options = {}) {
+  let workspace;
   try {
-    root = await resolveRepoRoot(workspace.path);
+    workspace = await readWorkspace();
+  } catch {
+    return panelRepositoryState(null, null, panelState);
+  }
+  let scan = null;
+  let failure = null;
+  try {
+    scan = await inspectWorkspace(workspace, options);
   } catch (error) {
-    throw fail("INTERNAL", `Failed to inspect git repository at ${workspace.path}: ${error.message}`);
+    failure = error;
   }
-  if (!root) {
-    throw fail("NOT_FOUND", `Not a git repository: ${workspace.path}`);
+  const payload = await panelRepositoryState(workspace, scan, panelState);
+  if (failure) payload.inspectionError = `Failed to inspect git repositories: ${failure.message}`;
+  return payload;
+}
+
+/**
+ * Resolve the repository a git request names. The root is validated against the
+ * discovered set and returned as a value every git call of the operation uses,
+ * so a later selection change can never redirect an in-flight write.
+ */
+async function resolveRequestRoot(args) {
+  const workspace = await readWorkspace();
+  const scan = await inspectWorkspace(workspace);
+  const requested = String(args?.repoRoot ?? "");
+  if (!requested) {
+    throw fail(
+      "INVALID_ARGUMENT",
+      "repoRoot is required: pass the repository root reported by git.state",
+    );
   }
-  return { workspace, root };
+  const match = findRepository(scan.repos, requested);
+  if (!match) {
+    throw fail(
+      "NOT_FOUND",
+      `Unknown repository: ${requested}. Only repositories discovered in the current workspace can be used.`,
+    );
+  }
+  return { workspace, root: match.root, scan };
 }
 
 function mergeCounts(nameStatus, numstat) {
@@ -231,7 +333,7 @@ async function stashListFor(root) {
 // ---------------------------------------------------------------------------
 
 async function toolStatus(args) {
-  const { root, workspace } = await getRepoContext();
+  const { root, workspace } = await resolveRequestRoot(args);
   const gitArgs = ["status", "--porcelain=v1", "-b", "--untracked-files=all"];
   const rel = args?.path ? requireRepoPath(args.path) : null;
   if (rel) gitArgs.push("--", rel);
@@ -254,7 +356,7 @@ async function toolStatus(args) {
 }
 
 async function toolLog(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const count = clampInt(args?.count, 1, 100, 20);
   const gitArgs = ["log", "--no-color", "-n", String(count)];
   if (args?.query) gitArgs.push("--grep", String(args.query), "-i");
@@ -267,7 +369,7 @@ async function toolLog(args) {
 }
 
 async function toolShow(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const ref = args?.ref ? requireRef(args.ref, "ref") : "HEAD";
   const wantPatch = args?.patch === true;
   const wantStat = args?.stat !== false;
@@ -305,7 +407,7 @@ async function toolShow(args) {
 }
 
 async function toolDiff(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const base = args?.base ? requireRef(args.base, "base") : "HEAD";
   const target = args?.target !== undefined && String(args.target) !== ""
     ? requireRef(args.target, "target")
@@ -344,7 +446,7 @@ async function toolDiff(args) {
 }
 
 async function toolBlame(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const rel = requireRepoPath(args?.path);
   const startLine = clampInt(args?.startLine, 1, 1_000_000_000, 0);
   const endLine = clampInt(args?.endLine, 1, 1_000_000_000, 0);
@@ -370,7 +472,7 @@ async function toolBlame(args) {
 }
 
 async function toolBranch(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const action = String(args?.action || "list");
 
   async function branchList() {
@@ -420,7 +522,7 @@ async function toolBranch(args) {
 }
 
 async function toolCommit(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const message = String(args?.message ?? "").trim();
   if (!message) throw fail("INVALID_ARGUMENT", "message is required for git_commit");
   if (message.length > 5000) throw fail("INVALID_ARGUMENT", "message is too long (max 5000 characters)");
@@ -453,12 +555,12 @@ async function toolCommit(args) {
     subject,
     amended: amend,
     message,
-    status: await toolStatus({}),
+    status: await toolStatus({ repoRoot: root }),
   };
 }
 
 async function toolStash(args) {
-  const { root } = await getRepoContext();
+  const { root } = await resolveRequestRoot(args);
   const action = String(args?.action || "list");
   const index = clampInt(args?.index, 0, 10_000, 0);
   const stashRef = `stash@{${index}}`;
@@ -532,15 +634,26 @@ async function openPanelView(view, extra = {}) {
 async function onPanelInvoke(channel, payload) {
   const args = payload || {};
   switch (channel) {
-    case "git.state": {
-      const context = await getRepoContext().catch(() => null);
-      return {
-        ok: true,
-        state: panelState,
-        workspace: context ? { path: context.workspace.path, name: context.workspace.name } : null,
-        repoRoot: context ? context.root : null,
-        appearance: await readAppearance(),
-      };
+    case "git.state":
+      return readPanelState();
+    case "git.refreshRepositories":
+      return readPanelState({ refresh: true });
+    case "git.selectRepository": {
+      const workspace = await readWorkspace();
+      const scan = await inspectWorkspace(workspace);
+      const requested = String(args.repoRoot ?? "");
+      if (!requested) {
+        throw fail("INVALID_ARGUMENT", "repoRoot is required to select a repository");
+      }
+      const match = findRepository(scan.repos, requested);
+      if (!match) {
+        throw fail(
+          "NOT_FOUND",
+          `Unknown repository: ${requested}. Choose a repository discovered in this workspace.`,
+        );
+      }
+      selectedRepositories.set(workspaceKeyFor(workspace), match.root);
+      return panelRepositoryState(workspace, scan, panelState);
     }
     case "app.getAppearance":
       return readAppearance();

@@ -22,6 +22,7 @@
         <div class="status-line">
           <span class="status-branch" id="branchChip"></span>
           <span class="status-meta" id="repoChip"></span>
+          <select class="repo-select" id="repoSelect" aria-label="Repository" hidden></select>
           <button type="button" class="icon-button" id="refreshAll" aria-label="Refresh"></button>
         </div>
         <nav class="segmented" id="nav" role="tablist" aria-label="Git Lens views"></nav>
@@ -37,6 +38,7 @@
     </div>
 
     <script src="./appearance.js"></script>
+    <script src="./selection.js"></script>
     <script src="./panel.js"></script>
   </body>
 </html>

@@ -1,14 +1,14 @@
 # Git Lens
 
 A [GitLens](https://www.gitkraken.com/gitlens)-inspired local Git management
-plugin for PI-Desktop. It turns the current workspace's repository into a
-visual dashboard in the right work panel. Human UI only — it does not register
-agent tools.
+plugin for PI-Desktop. It turns the current workspace — one repository, or
+several side by side — into a visual dashboard in the right work panel. Human
+UI only — it does not register agent tools.
 
 Plugin ID: `pi.gitlens`  
-Requires PI-Desktop `>= 0.8.0`. Reads and writes only the repository resolved
-from the current workspace, through the system `git` binary — no network, no
-credentials, no agent tools.
+Requires PI-Desktop `>= 0.8.0`. Reads and writes only the repositories
+discovered inside the current workspace, through the system `git` binary — no
+network, no credentials, no agent tools.
 
 ## Install
 
@@ -18,8 +18,12 @@ credentials, no agent tools.
 ## Test
 
 ```bash
-node --test test/*.test.mjs
+node --test test/*.test.mjs tests/*.test.js
 ```
+
+Both suites create their own throwaway repositories under the OS temp directory
+(set `GITLENS_TEST_TMPDIR` to point them elsewhere) and never touch an existing
+project.
 
 ## Features
 
@@ -36,13 +40,68 @@ node --test test/*.test.mjs
     to open its diff in a full-page sheet; compact commit box.
   - **Branches** — list with current badge, create / switch / safe delete.
   - **Blame** — GitLens-style per-line attribution for any repo-relative file.
+- **Repository switcher** — when the project folder holds several independent
+  repositories, a compact header selector switches between them and remembers
+  the choice per workspace.
 - **Commands** — `Git Lens: Open`, `Open History`, `Open Changes`,
   `Open Branches`, `Open Blame` from the command palette.
 
+## Multi-repository workspaces
+
+A project folder does not have to be a single repository. A folder that holds
+independent checkouts — for example `frontend/`, `backend/` and `shared/` —
+works without any extra configuration:
+
+- **Discovery** — a bounded breadth-first scan of the workspace looks for a
+  `.git` directory *or* a `.git` file (worktree / submodule checkout), at most
+  three levels deep and within a capped number of directories. Generated trees
+  (`node_modules`, `vendor`, `build`, `dist`, `target`, `obj`, `coverage`, …)
+  and dot directories (`.git`, `.cache`, `.next`, `.venv`, …) are skipped, and
+  symlinks/junctions are never followed, so discovery cannot escape the opened
+  folder. Candidates are confirmed with `git rev-parse --show-toplevel` and
+  de-duplicated by canonical path.
+- **Ordering** — the repository that contains the workspace (its own root, or
+  an ancestor root when the project lives inside a repository) is always first,
+  so a plain single-repository project behaves exactly as before. Descendants
+  follow, sorted by their path relative to the workspace.
+- **Caching** — the scan is cached per workspace and coalesced, including a
+  scan that failed, so the panel's one-second refresh never spawns a filesystem
+  walk or git (not even while git is broken). The header `Refresh` button is
+  the only retry: it rescans, replaces the cached result and redraws. Changing
+  the workspace scans once.
+- **Selection** — a compact header selector lists the discovered repositories
+  and stays hidden unless there is more than one. The choice is kept in plugin
+  memory per workspace and, defensively, in
+  `localStorage["pi.gitlens.selectedRepo.v1"]`, so it survives a panel reload;
+  missing or blocked storage only costs the remembered choice.
+- **Isolation** — every request names its `repoRoot`, which is validated
+  against the discovered set (a subdirectory, a checkout discovery skipped or
+  an arbitrary path is rejected) and held for the whole operation, including
+  the post-commit status. Switching repositories resets detail/navigation state
+  and bumps a generation counter, so late responses, stale errors and armed
+  confirmation closures (for example the two-step branch delete) can no longer
+  paint or write into the newly selected repository.
+- **States** — "no project open", "this project has no git repository", a
+  genuine inspection failure (`git` missing, unreadable folder) and a partial
+  failure ("these repositories work, but one candidate could not be inspected")
+  are different messages; a failure never hides the workspace, and a partial
+  failure is shown as a banner next to the usable repositories.
+
+Known limits of the bounded heuristic: repositories deeper than three levels
+below the workspace are not listed, a repository hidden inside a skipped
+generated directory is not listed, and a workspace that is itself a repository
+keeps its own (or ancestor) root as the primary entry with nested checkouts
+listed after it.
+
 ## How it works
 
-- The repository root is resolved from the current workspace via
-  `git rev-parse --show-toplevel`; every command runs with `-C <repoRoot>`.
+- The repositories of the workspace are discovered by a bounded local scan
+  (depth 3, directory cap, generated trees skipped, symlinks never followed)
+  and verified with `git rev-parse --show-toplevel`. The repository that
+  contains the workspace is listed first.
+- Every panel request names one of those discovered roots; the plugin validates
+  it and every git call of the operation runs with `-C <root>`, so a request
+  can never touch another checkout or an arbitrary path.
 - Git is executed through `execFile` with argument arrays — no shell, no
   string interpolation — so paths and refs cannot become commands.
 - `GIT_TERMINAL_PROMPT=0` is set, so git never blocks waiting for
@@ -78,20 +137,35 @@ inside the plugin process.
 
 - PI-Desktop `>= 0.8.0`
 - `git` available on `PATH`
-- The current workspace must be inside a git repository
+- The workspace must contain at least one git repository: itself, an ancestor
+  of it, or a checkout up to three levels below it
 
 ## Development
 
 ```bash
 python3 scripts/pack_plugin.py plugins/pi.gitlens
 python3 scripts/rebuild_catalog.py
-node tests/gitlens.test.mjs
+node --test test/*.test.mjs tests/*.test.js
 ```
 
 Install the packed `.piplug` via **Plugins → Install plugin package**, or load
 the folder as a development plugin.
 
 ## Changelog
+
+### Unreleased
+
+Multi-repository workspaces: bounded, cached discovery of sibling checkouts, a
+header repository selector with per-workspace memory, and per-request
+`repoRoot` validation so every read and write stays bound to the repository it
+was made for.
+
+### 0.2.8
+
+First release from the plugin's own repository
+https://github.com/vastsa/pi-plugin-gitlens — the source moved out of the plugin
+monorepo, nothing else changed. 首个从独立仓库发布的版本，源码从插件单仓库迁出，
+功能未变。
 
 ### 0.2.7
 

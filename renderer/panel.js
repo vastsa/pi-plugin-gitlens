@@ -26,6 +26,10 @@ const STRINGS = {
     behind: "behind",
     gone: "gone",
     noRepo: "The current project is not a git repository.",
+    noRepositories: "No git repositories found in this project.",
+    repository: "Repository",
+    inspectionFailed: "Could not inspect git repositories",
+    inspectionWarning: "Some repositories could not be inspected",
     noWorkspace: "No project is open. Open a project folder, then retry.",
     loading: "Loading…",
     search: "Search commits…",
@@ -102,6 +106,10 @@ const STRINGS = {
     behind: "落后",
     gone: "已删除",
     noRepo: "当前项目不是 git 仓库。",
+    noRepositories: "此项目中未找到 git 仓库。",
+    repository: "仓库",
+    inspectionFailed: "无法检查 git 仓库",
+    inspectionWarning: "部分仓库无法检查",
     noWorkspace: "未打开项目。请先打开项目文件夹，再重试。",
     loading: "加载中…",
     search: "搜索提交…",
@@ -172,10 +180,31 @@ let locale = "en";
 let currentView = "overview";
 let repoRoot = null;
 let workspace = null;
+let workspaceKey = null;
+let repositories = [];
+let inspectionError = null;
+let inspectionWarning = null;
 let initialPanelState = null;
 let historyCache = null;
 let diffCache = null;
 let blameCache = null;
+let lastBannerMessage = null;
+
+/* git.state / refresh / select all return the same payload; responses are
+ * sequenced so a slow older reply can never overwrite a newer one. */
+let hostStateRequested = 0;
+let hostStateApplied = 0;
+
+/* Repository switching is guarded by a generation counter (renderer/selection.js):
+ * every request, confirmation closure and late response carries the generation
+ * it was created in, so nothing can paint or write against a repository the
+ * user has just left. */
+const SELECTION_STORAGE_KEY = "pi.gitlens.selectedRepo.v1";
+const selectionApi = typeof window !== "undefined" ? window.__gitlensSelection : null;
+const repoGuard =
+  selectionApi && typeof selectionApi.createRepositoryGuard === "function"
+    ? selectionApi.createRepositoryGuard()
+    : null;
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -212,6 +241,61 @@ function bridge(channel, payload) {
   });
 }
 
+/* Raw host invoke for pinned requests: the guard normalises ok:false. */
+function invokeHost(channel, payload) {
+  return window.pluginBridge.invoke(channel, payload || {});
+}
+
+const pinnedRequest =
+  repoGuard && selectionApi && typeof selectionApi.createPinnedChannel === "function"
+    ? selectionApi.createPinnedChannel({ guard: repoGuard, invoke: invokeHost })
+    : null;
+
+/** A git request bound to the repository of `generation`. */
+function pinned(generation, channel, payload) {
+  if (!pinnedRequest) return Promise.reject(new Error(t.operationFailed));
+  return pinnedRequest(generation, channel, payload);
+}
+
+function currentGeneration() {
+  return repoGuard ? repoGuard.generation : 0;
+}
+
+function isStale(error) {
+  return Boolean(selectionApi && selectionApi.isStaleError(error));
+}
+
+/** Paint a failure, unless it belongs to a repository the user already left. */
+function reportFailure(container, error) {
+  if (isStale(error) || !container) return;
+  container.textContent = "";
+  const message = error && error.message ? error.message : String(error);
+  container.appendChild(emptyState(message));
+}
+
+function toastFailure(error, fallback) {
+  if (isStale(error)) return;
+  toast((error && error.message) || fallback || String(error), "error");
+}
+
+/**
+ * Host-state responses (git.state, git.refreshRepositories,
+ * git.selectRepository) share one payload shape and all call applyHostState.
+ * They are sequenced so out-of-order replies cannot override newer state: a
+ * response is applied only when it is newer than everything applied so far,
+ * and applying it records it as the newest.
+ */
+function nextHostStateRequest() {
+  hostStateRequested += 1;
+  return hostStateRequested;
+}
+
+function applyHostStateSequence(sequence, state, options) {
+  if (sequence <= hostStateApplied) return null;
+  hostStateApplied = sequence;
+  return applyHostState(state, options);
+}
+
 function toast(message, kind) {
   let wrap = document.querySelector(".toast-wrap");
   if (!wrap) {
@@ -228,12 +312,16 @@ function toast(message, kind) {
 
 function showBanner(message) {
   const banner = $("banner");
-  if (!message) {
+  if (!banner) return;
+  const next = message || null;
+  if (next === lastBannerMessage) return;
+  lastBannerMessage = next;
+  if (!next) {
     banner.hidden = true;
     banner.textContent = "";
     return;
   }
-  banner.textContent = message;
+  banner.textContent = next;
   banner.hidden = false;
 }
 
@@ -409,8 +497,7 @@ function renderSheet(view) {
   const body = el("div", "sheet-body");
   sheet.append(bar, body);
   Promise.resolve(frame.fill(body)).catch((error) => {
-    body.textContent = "";
-    body.appendChild(emptyState(error.message || String(error)));
+    reportFailure(body, error);
   });
 }
 
@@ -422,6 +509,7 @@ function openCommitSheet(view, commit) {
 }
 
 async function fillCommitSheet(view, body, commit) {
+  const generation = currentGeneration();
   const meta = el("div", "detail-meta");
   meta.append(
     el("span", "", `${commit.author}${commit.authorEmail ? ` <${commit.authorEmail}>` : ""}`),
@@ -435,7 +523,8 @@ async function fillCommitSheet(view, body, commit) {
   const filesBox = el("div", "group");
   body.appendChild(filesBox);
   try {
-    const detail = await bridge("git.show", { ref: commit.sha, stat: true, patch: false });
+    const detail = await pinned(generation, "git.show", { ref: commit.sha, stat: true, patch: false });
+    if (generation !== currentGeneration()) return;
     if (!detail.files.length) {
       filesBox.appendChild(el("div", "empty", t.noChanges));
       return;
@@ -445,20 +534,26 @@ async function fillCommitSheet(view, body, commit) {
         pushSheet(view, {
           title: file.path,
           fill: async (patchBody) => {
-            const withPatch = await bridge("git.show", {
-              ref: commit.sha,
-              path: file.path,
-              patch: true,
-              stat: false,
-            });
-            renderPatch(patchBody, withPatch.patch);
-            if (!withPatch.patch) patchBody.appendChild(emptyState("—"));
+            const patchGeneration = currentGeneration();
+            try {
+              const withPatch = await pinned(patchGeneration, "git.show", {
+                ref: commit.sha,
+                path: file.path,
+                patch: true,
+                stat: false,
+              });
+              if (patchGeneration !== currentGeneration()) return;
+              renderPatch(patchBody, withPatch.patch);
+              if (!withPatch.patch) patchBody.appendChild(emptyState("—"));
+            } catch (error) {
+              reportFailure(patchBody, error);
+            }
           },
         });
       }));
     }
   } catch (error) {
-    filesBox.appendChild(emptyState(error.message || String(error)));
+    reportFailure(filesBox, error);
   }
 }
 
@@ -466,12 +561,14 @@ function openFileSheet(view, file) {
   pushSheet(view, {
     title: file.path,
     fill: async (body) => {
+      const generation = currentGeneration();
       try {
-        const result = await bridge("git.diff", { path: file.path, patch: true, stat: false });
+        const result = await pinned(generation, "git.diff", { path: file.path, patch: true, stat: false });
+        if (generation !== currentGeneration()) return;
         renderPatch(body, result.patch);
         if (!result.patch) body.appendChild(emptyState("—"));
       } catch (error) {
-        body.appendChild(emptyState(error.message || String(error)));
+        reportFailure(body, error);
       }
     },
   });
@@ -480,12 +577,15 @@ function openFileSheet(view, file) {
 /* ---- view: overview ----------------------------------------------------- */
 
 async function renderOverview() {
+  const generation = currentGeneration();
   const view = $("view-overview");
   closeSheet(view);
   view.textContent = "";
   const listPane = el("div", "list-pane");
-  const status = await bridge("git.status");
-  const log = await bridge("git.log", { count: 10 });
+  const status = await pinned(generation, "git.status");
+  if (generation !== currentGeneration()) return;
+  const log = await pinned(generation, "git.log", { count: 10 });
+  if (generation !== currentGeneration()) return;
 
   const stats = [
     { label: t.staged, value: status.staged.length, cls: "staged" },
@@ -518,6 +618,7 @@ async function renderOverview() {
 /* ---- view: history ------------------------------------------------------ */
 
 async function renderHistory() {
+  const generation = currentGeneration();
   const view = $("view-history");
   closeSheet(view);
   view.textContent = "";
@@ -544,7 +645,8 @@ async function renderHistory() {
       const payload = { count: 100 };
       if (search.value.trim()) payload.query = search.value.trim();
       if (pathInput.value.trim()) payload.path = pathInput.value.trim();
-      const log = await bridge("git.log", payload);
+      const log = await pinned(generation, "git.log", payload);
+      if (generation !== currentGeneration()) return;
       const focusSha = historyCache?.focusSha || null;
       historyCache = { query: search.value, path: pathInput.value };
       listBox.textContent = "";
@@ -560,8 +662,7 @@ async function renderHistory() {
         if (focus) openCommitSheet(view, focus);
       }
     } catch (error) {
-      listBox.textContent = "";
-      listBox.appendChild(emptyState(error.message || String(error)));
+      reportFailure(listBox, error);
     }
   };
 
@@ -581,6 +682,7 @@ function openCommitDetail(viewName, sha) {
 /* ---- view: changes (diff) ------------------------------------------------ */
 
 async function renderChanges() {
+  const generation = currentGeneration();
   const view = $("view-diff");
   closeSheet(view);
   view.textContent = "";
@@ -602,7 +704,8 @@ async function renderChanges() {
     groups.appendChild(el("div", "loading", t.loading));
     try {
       const payload = pathInput.value.trim() ? { path: pathInput.value.trim() } : {};
-      const status = await bridge("git.status", payload);
+      const status = await pinned(generation, "git.status", payload);
+      if (generation !== currentGeneration()) return;
       diffCache = { path: pathInput.value };
       groups.textContent = "";
 
@@ -629,8 +732,7 @@ async function renderChanges() {
       }
       if (!any) groups.appendChild(emptyState(t.noChanges));
     } catch (error) {
-      groups.textContent = "";
-      groups.appendChild(emptyState(error.message || String(error)));
+      reportFailure(groups, error);
     }
   };
 
@@ -641,6 +743,7 @@ async function renderChanges() {
 function renderCommitBox(listPane) {
   const existing = listPane.querySelector(".commit-box");
   if (existing) existing.remove();
+  const generation = currentGeneration();
 
   const box = el("div", "commit-box");
   const textarea = el("textarea", "input");
@@ -663,6 +766,7 @@ function renderCommitBox(listPane) {
   listPane.appendChild(box);
 
   commitBtn.addEventListener("click", async () => {
+    if (generation !== currentGeneration()) return;
     const message = textarea.value.trim();
     if (!message) {
       toast(t.commitMessage, "error");
@@ -670,16 +774,18 @@ function renderCommitBox(listPane) {
     }
     commitBtn.disabled = true;
     try {
-      const result = await bridge("git.commit", {
+      const result = await pinned(generation, "git.commit", {
         message,
         stage: stageCheck.checked ? "all" : "tracked",
         amend: amendCheck.checked,
       });
+      if (generation !== currentGeneration()) return;
       toast(`${t.committed} ${result.sha} · ${result.subject}`, "ok");
       textarea.value = "";
       amendCheck.checked = false;
       renderChanges();
     } catch (error) {
+      if (generation !== currentGeneration() || isStale(error)) return;
       const msg = error.message || String(error);
       toast(msg.includes("nothing to commit") ? t.nothingCommitted : msg, "error");
     } finally {
@@ -691,6 +797,7 @@ function renderCommitBox(listPane) {
 /* ---- view: branches ------------------------------------------------------ */
 
 async function renderBranches() {
+  const generation = currentGeneration();
   const view = $("view-branches");
   closeSheet(view);
   view.textContent = "";
@@ -713,7 +820,8 @@ async function renderBranches() {
     listBox.textContent = "";
     listBox.appendChild(el("div", "loading", t.loading));
     try {
-      const result = await bridge("git.branch", { action: "list" });
+      const result = await pinned(generation, "git.branch", { action: "list" });
+      if (generation !== currentGeneration()) return;
       listBox.textContent = "";
       if (!result.branches.length) {
         listBox.appendChild(emptyState(t.noBranches));
@@ -732,12 +840,14 @@ async function renderBranches() {
         if (branch.name !== result.current) {
           const switchBtn = el("button", "button", t.switchBranch);
           switchBtn.addEventListener("click", async () => {
+            if (generation !== currentGeneration()) return;
             try {
-              await bridge("git.branch", { action: "switch", name: branch.name });
+              await pinned(generation, "git.branch", { action: "switch", name: branch.name });
+              if (generation !== currentGeneration()) return;
               toast(`${t.switched} ${branch.name}`, "ok");
               run();
             } catch (error) {
-              toast(error.message || String(error), "error");
+              toastFailure(error);
             }
           });
           actions.appendChild(switchBtn);
@@ -745,7 +855,9 @@ async function renderBranches() {
           let arming = false;
           deleteBtn.addEventListener("click", async () => {
             // Two-step confirmation: the sandboxed panel window does not get a
-            // reliable window.confirm, so the first click arms the button.
+            // reliable window.confirm, so the first click arms the button. The
+            // closure stays bound to the repository it was rendered for.
+            if (generation !== currentGeneration()) return;
             if (!arming) {
               arming = true;
               deleteBtn.textContent = `${t.deleteBranchConfirm}: ${branch.name}?`;
@@ -758,11 +870,13 @@ async function renderBranches() {
             arming = false;
             deleteBtn.disabled = true;
             try {
-              await bridge("git.branch", { action: "delete", name: branch.name });
+              await pinned(generation, "git.branch", { action: "delete", name: branch.name });
+              if (generation !== currentGeneration()) return;
               toast(`${t.deleted} ${branch.name}`, "ok");
               run();
             } catch (error) {
-              toast(error.message || String(error), "error");
+              if (generation !== currentGeneration()) return;
+              toastFailure(error);
               deleteBtn.disabled = false;
               deleteBtn.textContent = t.deleteBranch;
             }
@@ -774,12 +888,12 @@ async function renderBranches() {
       }
       listBox.appendChild(grouped(rows));
     } catch (error) {
-      listBox.textContent = "";
-      listBox.appendChild(emptyState(error.message || String(error)));
+      reportFailure(listBox, error);
     }
   };
 
   createBtn.addEventListener("click", async () => {
+    if (generation !== currentGeneration()) return;
     const name = nameInput.value.trim();
     if (!name) {
       toast(t.branchName, "error");
@@ -789,13 +903,14 @@ async function renderBranches() {
     try {
       const payload = { action: "create", name };
       if (startInput.value.trim()) payload.startPoint = startInput.value.trim();
-      await bridge("git.branch", payload);
+      await pinned(generation, "git.branch", payload);
+      if (generation !== currentGeneration()) return;
       toast(`${t.created} ${name}`, "ok");
       nameInput.value = "";
       startInput.value = "";
       run();
     } catch (error) {
-      toast(error.message || String(error), "error");
+      toastFailure(error);
     } finally {
       createBtn.disabled = false;
     }
@@ -807,6 +922,7 @@ async function renderBranches() {
 /* ---- view: blame --------------------------------------------------------- */
 
 async function renderBlame() {
+  const generation = currentGeneration();
   const view = $("view-blame");
   closeSheet(view);
   view.textContent = "";
@@ -833,7 +949,8 @@ async function renderBlame() {
     out.textContent = "";
     out.appendChild(el("div", "loading", t.loading));
     try {
-      const result = await bridge("git.blame", { path: pathValue, limit: 5000 });
+      const result = await pinned(generation, "git.blame", { path: pathValue, limit: 5000 });
+      if (generation !== currentGeneration()) return;
       blameCache = { path: pathValue };
       out.textContent = "";
       const table = el("table", "blame-table");
@@ -859,8 +976,7 @@ async function renderBlame() {
         out.appendChild(el("div", "empty", t.truncated.replace("{n}", String(result.lines.length))));
       }
     } catch (error) {
-      out.textContent = "";
-      out.appendChild(emptyState(error.message || String(error)));
+      reportFailure(out, error);
     }
   };
 
@@ -880,18 +996,15 @@ function refreshButton() {
 }
 
 function renderCurrentView() {
-  const showBannerMessage = () => {
-    if (!repoRoot) showBanner(workspace ? t.noRepo : t.noWorkspace);
-    else showBanner(null);
-  };
-  showBannerMessage();
+  showBanner(statusMessage());
   const view = $("view-" + currentView);
   closeSheet(view);
   view.textContent = "";
   if (!repoRoot) {
-    view.appendChild(emptyState(workspace ? t.noRepo : t.noWorkspace));
+    view.appendChild(emptyState(statusMessage() || t.noRepositories));
     return;
   }
+  const generation = currentGeneration();
   const renderers = {
     overview: renderOverview,
     history: renderHistory,
@@ -899,10 +1012,13 @@ function renderCurrentView() {
     branches: renderBranches,
     blame: renderBlame,
   };
-  (renderers[currentView] || renderOverview)().catch((error) => {
-    view.textContent = "";
-    view.appendChild(emptyState(error.message || String(error)));
-  });
+  Promise.resolve()
+    .then(() => (renderers[currentView] || renderOverview)())
+    .catch((error) => {
+      if (generation !== currentGeneration() || isStale(error)) return;
+      view.textContent = "";
+      view.appendChild(emptyState(error.message || String(error)));
+    });
 }
 
 let lastOpenedAt = null;
@@ -943,15 +1059,191 @@ function applyHostAppearance(appearance) {
   if (adapter && typeof adapter.apply === "function") adapter.apply(appearance);
 }
 
+/* ---- repository selection ---------------------------------------------- */
+
+function statusMessage() {
+  if (!workspace) return t.noWorkspace;
+  if (inspectionError) return `${t.inspectionFailed}: ${inspectionError}`;
+  if (!repositories.length) return t.noRepositories;
+  if (inspectionWarning) return `${t.inspectionWarning}: ${inspectionWarning.message}`;
+  return null;
+}
+
+/* localStorage is optional: a locked-down or private window must not break the
+ * panel, the selection just falls back to the plugin's own memory. */
+function rememberedSelection() {
+  try {
+    if (!workspaceKey || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(SELECTION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const value = parsed[workspaceKey];
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberSelection(root) {
+  try {
+    if (!workspaceKey || !root || !window.localStorage) return;
+    const raw = window.localStorage.getItem(SELECTION_STORAGE_KEY);
+    let map = {};
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) map = parsed;
+    }
+    map[workspaceKey] = root;
+    const keys = Object.keys(map);
+    if (keys.length > 20) {
+      const trimmed = {};
+      for (const key of keys.slice(keys.length - 20)) trimmed[key] = map[key];
+      map = trimmed;
+    }
+    window.localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    /* storage unavailable or full: the in-memory selection still works */
+  }
+}
+
+function allowedRoot(root) {
+  if (!root) return false;
+  return repositories.some((repo) => repo.root === root);
+}
+
+/** Current selection wins; otherwise the remembered one, then discovery order. */
+function preferredRoot(state, workspaceChanged) {
+  if (!repositories.length) return null;
+  if (!workspaceChanged && allowedRoot(repoRoot)) return repoRoot;
+  const remembered = rememberedSelection();
+  if (allowedRoot(remembered)) return remembered;
+  if (state && allowedRoot(state.repoRoot)) return state.repoRoot;
+  return repositories[0].root;
+}
+
+function applySelectedRoot(next) {
+  if (!repoGuard) return false;
+  const changed = repoGuard.setRoot(next);
+  repoRoot = repoGuard.root;
+  return changed;
+}
+
+/** Everything that belongs to one repository and must not leak into the next. */
+function resetDetailState() {
+  historyCache = null;
+  diffCache = null;
+  blameCache = null;
+  for (const item of NAV_ITEMS) closeSheet($(`view-${item.id}`));
+}
+
+/**
+ * Merge a git.state-shaped payload. A workspace change or a repository change
+ * bumps the selection generation, so in-flight responses and armed
+ * confirmation closures from the previous selection can no longer paint or
+ * write.
+ */
+function applyHostState(state, { force = false } = {}) {
+  const nextWorkspaceKey = state && state.workspace && state.workspace.path ? state.workspace.path : null;
+  const workspaceChanged = nextWorkspaceKey !== workspaceKey;
+  workspace = (state && state.workspace) || null;
+  workspaceKey = nextWorkspaceKey;
+  repositories = Array.isArray(state && state.repositories)
+    ? state.repositories.filter((repo) => repo && typeof repo.root === "string")
+    : [];
+  inspectionError = state && typeof state.inspectionError === "string" ? state.inspectionError : null;
+  inspectionWarning =
+    state && state.inspectionWarning && typeof state.inspectionWarning.message === "string"
+      ? state.inspectionWarning
+      : null;
+  if (state) applyHostAppearance(state.appearance);
+
+  if (workspaceChanged && repoRoot) applySelectedRoot(null);
+  const switched = applySelectedRoot(preferredRoot(state, workspaceChanged));
+  if (switched) resetDetailState();
+  renderRepoSelect();
+  return { workspaceChanged, switched: switched || workspaceChanged || force };
+}
+
+function switchRepository(next) {
+  if (!allowedRoot(next) || next === repoRoot) return false;
+  applySelectedRoot(next);
+  resetDetailState();
+  rememberSelection(next);
+  renderRepoSelect();
+  renderCurrentView();
+  updateStatus();
+  notifyHostSelection(next);
+  return true;
+}
+
+/** Keep the plugin's per-workspace selection in sync (fire and forget). */
+function notifyHostSelection(root) {
+  if (!root) return;
+  const sequence = nextHostStateRequest();
+  bridge("git.selectRepository", { repoRoot: root, workspace: workspaceKey })
+    .then((state) => {
+      // The echo is only applied when no newer state response has landed, and
+      // it never re-renders on its own: the local switch already did.
+      applyHostStateSequence(sequence, state);
+    })
+    .catch(() => {});
+}
+
+function renderRepoSelect() {
+  const select = $("repoSelect");
+  if (!select) return;
+  const signature = repositories.map((repo) => repo.root).join("\u0000");
+  if (select.dataset.signature !== signature) {
+    select.textContent = "";
+    for (const repo of repositories) {
+      const label = repo.relativePath && repo.relativePath !== "." ? repo.relativePath : repo.name;
+      const option = el("option", "", label || repo.root);
+      option.value = repo.root;
+      option.title = repo.root;
+      select.appendChild(option);
+    }
+    select.dataset.signature = signature;
+  }
+  select.hidden = repositories.length < 2;
+  select.title = t.repository;
+  select.setAttribute("aria-label", t.repository);
+  if (repoRoot && select.value !== repoRoot) select.value = repoRoot;
+}
+
+/** Refresh rescans the workspace for repositories, then redraws the view. */
+async function refreshRepositories() {
+  const button = $("refreshAll");
+  if (button) button.disabled = true;
+  const sequence = nextHostStateRequest();
+  try {
+    const state = await bridge("git.refreshRepositories", { workspace: workspaceKey });
+    if (!applyHostStateSequence(sequence, state, { force: true })) return;
+    resetDetailState();
+    renderCurrentView();
+    updateStatus();
+  } catch (error) {
+    showBanner(error.message || String(error));
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 async function syncHostState() {
+  const sequence = nextHostStateRequest();
   const state = await bridge("git.state");
-  const repoChanged = repoRoot !== state.repoRoot;
-  repoRoot = state.repoRoot;
-  workspace = state.workspace;
-  applyHostAppearance(state.appearance);
+  // A newer response (refresh/select/poll) already landed: drop this one.
+  const applied = applyHostStateSequence(sequence, state);
+  if (!applied) return;
   const switched = applyRequestedState(state.state);
-  if (repoChanged && !switched) renderCurrentView();
-  if (repoChanged || switched) updateStatus();
+  if (switched) {
+    updateStatus();
+    return;
+  }
+  if (applied.switched) {
+    renderCurrentView();
+    updateStatus();
+  }
 }
 
 async function init() {
@@ -963,8 +1255,15 @@ async function init() {
     refresh.setAttribute("aria-label", t.refresh);
     refresh.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>';
     refresh.addEventListener("click", () => {
-      updateStatus();
-      renderCurrentView();
+      refreshRepositories();
+    });
+  }
+  const select = $("repoSelect");
+  if (select) {
+    select.addEventListener("change", () => {
+      const next = select.value;
+      if (!next || next === repoRoot) return;
+      switchRepository(next);
     });
   }
   const appearance = window.__appearance;
@@ -977,18 +1276,21 @@ async function init() {
     appearance.onLocaleChange((next) => {
       setLocale(next);
       buildNav();
+      renderRepoSelect();
       updateStatus();
       renderCurrentView();
     });
   }
 
+  const sequence = nextHostStateRequest();
   try {
     const state = await bridge("git.state");
-    repoRoot = state.repoRoot;
-    workspace = state.workspace;
-    applyHostAppearance(state.appearance);
+    applyHostStateSequence(sequence, state);
     if (!applyRequestedState(state.state)) activateView("overview");
     updateStatus();
+    // The renderer remembers the last repository per workspace; keep the
+    // plugin's own selection in sync until the next explicit switch.
+    if (repoRoot && state.repoRoot !== repoRoot) notifyHostSelection(repoRoot);
   } catch (error) {
     showBanner(error.message || String(error));
     activateView("overview");
@@ -1006,27 +1308,33 @@ function updateStatus() {
   const repo = $("repoChip");
   const branch = $("branchChip");
   if (!repo || !branch) return;
+  const generation = currentGeneration();
+  const capturedRoot = repoRoot;
   if (!repoRoot) {
-    branch.textContent = workspace ? workspace.name : "—";
-    repo.textContent = workspace ? t.noRepo : t.noWorkspace;
-    repo.title = "";
+    branch.textContent = workspace ? workspace.name || "—" : "—";
+    repo.textContent = statusMessage() || "";
+    repo.title = inspectionError || "";
     return;
   }
   branch.textContent = "…";
-  repo.textContent = workspace ? workspace.name : "";
+  repo.textContent = workspace ? workspace.name || "" : "";
   repo.title = repoRoot || "";
-  bridge("git.status").then((status) => {
-    branch.textContent = status.branch || "HEAD";
-    const bits = [];
-    if (workspace?.name) bits.push(workspace.name);
-    if (status.upstream) bits.push(status.upstream);
-    if (status.ahead) bits.push(`↑${status.ahead}`);
-    if (status.behind) bits.push(`↓${status.behind}`);
-    repo.textContent = bits.join(" · ") || repoRoot;
-    repo.title = status.upstream ? `${status.branch} ↔ ${status.upstream}` : repoRoot;
-  }).catch(() => {
-    branch.textContent = "—";
-  });
+  pinned(generation, "git.status")
+    .then((status) => {
+      if (generation !== currentGeneration() || capturedRoot !== repoRoot) return;
+      branch.textContent = status.branch || "HEAD";
+      const bits = [];
+      if (workspace?.name) bits.push(workspace.name);
+      if (status.upstream) bits.push(status.upstream);
+      if (status.ahead) bits.push(`↑${status.ahead}`);
+      if (status.behind) bits.push(`↓${status.behind}`);
+      repo.textContent = bits.join(" · ") || repoRoot;
+      repo.title = status.upstream ? `${status.branch} ↔ ${status.upstream}` : repoRoot;
+    })
+    .catch((error) => {
+      if (generation !== currentGeneration() || isStale(error)) return;
+      branch.textContent = "—";
+    });
 }
 
 init().catch((error) => {

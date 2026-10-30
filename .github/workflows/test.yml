@@ -14,4 +14,4 @@ jobs:
         with:
           node-version: "22"
       - name: Plugin tests
-        run: node --test test/*.test.mjs
+        run: node --test test/*.test.mjs tests/*.test.js

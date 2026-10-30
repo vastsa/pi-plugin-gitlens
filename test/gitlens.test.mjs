@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
@@ -62,7 +62,7 @@ function createTempRepo() {
 test("manifest declares the expected identity, permissions and contributions", () => {
   assert.equal(manifest.schemaVersion, 1);
   assert.equal(manifest.id, "pi.gitlens");
-  assert.equal(manifest.version, "0.2.7");
+  assert.equal(manifest.version, "0.2.8");
   assert.equal(manifest.engines.piDesktop, ">=0.8.0");
   assert.deepEqual(manifest.permissions, ["ui.view"]);
   assert.equal(manifest.ui, undefined);
@@ -148,7 +148,20 @@ test("main.js registers commands only, and routes panel channels without agent t
   for (const command of manifest.contributes.commands) {
     assert.match(mainSource, new RegExp(`id: "${command.id}"`), `command ${command.id} registered`);
   }
-  for (const channel of ["git.state", "git.status", "git.log", "git.show", "git.diff", "git.blame", "git.branch", "git.commit", "git.stash"]) {
+  const panelChannels = [
+    "git.state",
+    "git.selectRepository",
+    "git.refreshRepositories",
+    "git.status",
+    "git.log",
+    "git.show",
+    "git.diff",
+    "git.blame",
+    "git.branch",
+    "git.commit",
+    "git.stash",
+  ];
+  for (const channel of panelChannels) {
     assert.match(mainSource, new RegExp(`case "${channel}"`), `panel channel ${channel} handled`);
   }
   assert.match(mainSource, /execFile\("git"/, "runs git through execFile");
@@ -377,6 +390,8 @@ test("panel handlers run end-to-end against a real repository", { skip: !hasGit 
     repo.run(["add", "-A"]);
     repo.run(["commit", "-m", "first commit"]);
     writeFileSync(join(repo.root, "a.txt"), "line one\nline two changed\nline three\n");
+    const subdir = join(repo.root, "sub");
+    mkdirSync(subdir);
 
     const previousPi = global.pi;
     global.pi = {
@@ -384,18 +399,33 @@ test("panel handlers run end-to-end against a real repository", { skip: !hasGit 
     };
 
     try {
-      const status = await main.onPanelInvoke("git.status", {});
+      // git.state carries the workspace plus the discovered repositories;
+      // every other panel call has to name one of those roots explicitly.
+      const state = await main.onPanelInvoke("git.state", {});
+      assert.equal(state.ok, true);
+      assert.equal(state.workspace.path, repo.root);
+      assert.equal(realpathSync(state.repoRoot), realpathSync(repo.root));
+      assert.deepEqual(
+        state.repositories.map((entry) => entry.root),
+        [state.repoRoot],
+      );
+      assert.equal(state.inspectionError, null);
+      assert.equal(state.appearance, null);
+      const repoRoot = state.repoRoot;
+
+      const status = await main.onPanelInvoke("git.status", { repoRoot });
       assert.equal(status.ok, true);
+      assert.equal(realpathSync(status.repo), realpathSync(repo.root));
       assert.equal(status.branch, "main");
       assert.equal(status.unstaged.length, 1);
       assert.equal(status.unstaged[0].path, "a.txt");
 
-      const log = await main.onPanelInvoke("git.log", { count: 5 });
+      const log = await main.onPanelInvoke("git.log", { repoRoot, count: 5 });
       assert.equal(log.ok, true);
       assert.equal(log.commits.length, 1);
       assert.match(log.commits[0].sha, /^[0-9a-f]{40}$/);
 
-      const diff = await main.onPanelInvoke("git.diff", { patch: true });
+      const diff = await main.onPanelInvoke("git.diff", { repoRoot, patch: true });
       assert.equal(diff.ok, true);
       assert.equal(diff.files.length, 1);
       assert.equal(diff.files[0].path, "a.txt");
@@ -403,48 +433,80 @@ test("panel handlers run end-to-end against a real repository", { skip: !hasGit 
       assert.equal(diff.files[0].deletions, 1);
       assert.match(diff.patch, /^diff --git a\/a\.txt/);
 
-      const blame = await main.onPanelInvoke("git.blame", { path: "a.txt", limit: 10 });
+      const blame = await main.onPanelInvoke("git.blame", { repoRoot, path: "a.txt", limit: 10 });
       assert.equal(blame.ok, true);
       assert.equal(blame.lines.length, 3);
       assert.equal(blame.lines[0].content, "line one");
 
-      const create = await main.onPanelInvoke("git.branch", { action: "create", name: "feat/e2e" });
+      const create = await main.onPanelInvoke("git.branch", {
+        repoRoot,
+        action: "create",
+        name: "feat/e2e",
+      });
       assert.equal(create.ok, true);
-      const branchList = await main.onPanelInvoke("git.branch", { action: "list" });
+      const branchList = await main.onPanelInvoke("git.branch", { repoRoot, action: "list" });
       assert.equal(branchList.branches.length, 2);
-      const switched = await main.onPanelInvoke("git.branch", { action: "switch", name: "feat/e2e" });
+      const switched = await main.onPanelInvoke("git.branch", {
+        repoRoot,
+        action: "switch",
+        name: "feat/e2e",
+      });
       assert.equal(switched.current, "feat/e2e");
 
       const committed = await main.onPanelInvoke("git.commit", {
+        repoRoot,
         message: "second commit",
         stage: "all",
       });
       assert.equal(committed.ok, true);
       assert.equal(committed.subject, "second commit");
       assert.match(committed.sha, /^[0-9a-f]{7,}$/);
+      // Post-commit status stays pinned to the repository that was committed.
+      assert.equal(committed.status.repo, repoRoot);
 
-      const clean = await main.onPanelInvoke("git.status", {});
+      const clean = await main.onPanelInvoke("git.status", { repoRoot });
       assert.equal(clean.staged.length, 0);
       assert.equal(clean.unstaged.length, 0);
       assert.equal(clean.untracked.length, 0);
 
       writeFileSync(join(repo.root, "a.txt"), "line one\nline two changed\nline three\nstashed line\n");
-      const stashPush = await main.onPanelInvoke("git.stash", { action: "push", message: "wip e2e" });
+      const stashPush = await main.onPanelInvoke("git.stash", {
+        repoRoot,
+        action: "push",
+        message: "wip e2e",
+      });
       assert.equal(stashPush.ok, true);
       assert.equal(stashPush.created, true);
-      const stashList = await main.onPanelInvoke("git.stash", { action: "list" });
+      const stashList = await main.onPanelInvoke("git.stash", { repoRoot, action: "list" });
       assert.equal(stashList.stashes.length, 1);
-      const stashPop = await main.onPanelInvoke("git.stash", { action: "pop" });
+      const stashPop = await main.onPanelInvoke("git.stash", { repoRoot, action: "pop" });
       assert.equal(stashPop.ok, true);
 
-      const state = await main.onPanelInvoke("git.state", {});
-      assert.equal(state.ok, true);
-      assert.equal(state.repoRoot, realpathSync(repo.root));
-      assert.equal(state.appearance, null);
+      // Only discovered roots are accepted: no root, a subdirectory of the
+      // repository and a sibling folder are all refused before git runs.
+      await assert.rejects(() => main.onPanelInvoke("git.status", {}), /repoRoot is required/);
+      await assert.rejects(
+        () => main.onPanelInvoke("git.status", { repoRoot: subdir }),
+        /Unknown repository/,
+      );
+      await assert.rejects(
+        () => main.onPanelInvoke("git.status", { repoRoot: join(repo.root, "..", "elsewhere") }),
+        /Unknown repository/,
+      );
 
       // Path/ref guards reject escapes through the panel channel too.
-      await assert.rejects(() => main.onPanelInvoke("git.blame", { path: "../etc/passwd" }));
-      await assert.rejects(() => main.onPanelInvoke("git.branch", { action: "create", name: "-rf" }));
+      await assert.rejects(
+        () => main.onPanelInvoke("git.blame", { repoRoot, path: "../etc/passwd" }),
+        /repository-relative path/,
+      );
+      await assert.rejects(
+        () => main.onPanelInvoke("git.branch", { repoRoot, action: "create", name: "-rf" }),
+        /safe git ref name/,
+      );
+      await assert.rejects(
+        () => main.onPanelInvoke("git.show", { repoRoot, ref: "--upload-pack=x" }),
+        /safe ref expression/,
+      );
     } finally {
       global.pi = previousPi;
     }
